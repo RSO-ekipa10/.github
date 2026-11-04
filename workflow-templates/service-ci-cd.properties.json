@@ -1,0 +1,16 @@
+{
+  "name": "Chance service CI/CD",
+  "description": "Calls the shared pipeline: checks on pull requests; on main the image is built once, pushed to Docker Hub and deployed to AKS with Helm, with a smoke test and rollback.",
+  "iconName": "octicon rocket",
+  "categories": [
+    "Continuous integration",
+    "Deployment",
+    "TypeScript",
+    "Kubernetes",
+    "Helm"
+  ],
+  "filePatterns": [
+    "^package\\.json$",
+    "^Dockerfile$"
+  ]
+}

@@ -1,0 +1,38 @@
+# Checks this repository's own workflows and the starter workflow before they reach the services.
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Same image as in service-ci-cd.yml. Dependabot does not see it: bump both by hand
+  # (README, "Tool versions").
+  ACTIONLINT_IMAGE: docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint the workflows and the starter workflow (actionlint, includes shellcheck)
+        run: docker run --rm -v "$PWD":/repo -w /repo "$ACTIONLINT_IMAGE" -color .github/workflows/*.yml workflow-templates/*.yml
+
+      - name: Starter workflow metadata is valid JSON
+        run: jq empty workflow-templates/*.properties.json
