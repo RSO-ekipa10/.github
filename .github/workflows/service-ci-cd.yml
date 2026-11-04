@@ -1,0 +1,518 @@
+# Shared CI/CD pipeline of the Chance services (TypeScript on Node.js, Docker Hub, Helm on AKS).
+# Every service repository calls it from a short .github/workflows/ci-cd.yml whose job id is
+# "pipeline", so the required status check in the branch ruleset is "pipeline / test".
+#
+#   pull request   test: workflow lint, lint, type check, unit tests with coverage,
+#                  chart checks (dev and prod values), image build without push
+#   push to main   test -> build (image built once, tag sha-<full commit SHA>, pushed to Docker Hub)
+#                       -> deploy (Helm to the prod namespace on AKS, smoke test, rollback on failure)
+#   manual run     deploy only: an image that main already built (redeploy or roll back by SHA)
+#
+# The job ids test, build and deploy are part of the check names: rename them only together
+# with the ruleset. Every action is pinned to a full commit SHA (tags can be moved by an
+# attacker); Dependabot proposes the action updates, the tool versions in "env" below are
+# bumped by hand. The called jobs can only lower the token permissions the caller grants,
+# never raise them.
+name: service-ci-cd
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name; also the Helm release name and the prefix of its Secret (<service>-env)
+        type: string
+        required: true
+      image-name:
+        description: Docker Hub repository name; empty means the service name
+        type: string
+        required: false
+        default: ""
+      dockerhub-username:
+        # Optional on purpose, like the token below: the build and deploy jobs check it, so a
+        # pull request without organization settings still gets its test job.
+        description: Docker Hub namespace; pass vars.DOCKERHUB_USERNAME (passed explicitly, not read here)
+        type: string
+        required: false
+        default: ""
+      node-version:
+        description: Node.js version for the test job (the Dockerfile pins its own base image)
+        type: string
+        required: false
+        default: "24"
+      chart-path:
+        description: Folder of the Helm chart
+        type: string
+        required: false
+        default: helm
+      values-file:
+        description: Values file for prod (used for the deploy and checked on every run)
+        type: string
+        required: false
+        default: helm/values-prod.yaml
+      dev-values-file:
+        description: Values file for local development (only checked, never deployed by this pipeline)
+        type: string
+        required: false
+        default: helm/values-dev.yaml
+      namespace:
+        description: Kubernetes namespace of the deploy
+        type: string
+        required: false
+        default: prod
+      deploy:
+        description: Deploy on pushes to main and manual runs (false = test and build only)
+        type: boolean
+        required: false
+        default: true
+      sha:
+        description: Manual runs only; full commit SHA of main whose image is already on Docker Hub (empty = the commit of the run)
+        type: string
+        required: false
+        default: ""
+      azure-client-id:
+        # An organization variable (team decision); the tenant and subscription IDs come in as
+        # secrets below, so the public deploy logs mask them. The deploy job checks all three.
+        description: Client ID of the deploy identity; pass vars.AZURE_CLIENT_ID
+        type: string
+        required: false
+        default: ""
+      aks-resource-group:
+        description: Resource group of the AKS cluster
+        type: string
+        required: false
+        default: rso-rg
+      aks-cluster-name:
+        description: Name of the AKS cluster
+        type: string
+        required: false
+        default: rso-cluster
+    secrets:
+      dockerhub-token:
+        # Not "required": pull requests from Dependabot or forks get no organization secrets,
+        # and their test job needs none. The build job checks that the token is there.
+        description: Docker Hub access token with read and write access (org secret DOCKERHUB_TOKEN)
+        required: false
+      azure-tenant-id:
+        # Optional for the same reason as the token: only the deploy job needs it and checks it.
+        description: Tenant ID of the deploy identity (org secret AZURE_TENANT_ID)
+        required: false
+      azure-subscription-id:
+        description: Subscription ID of the AKS cluster (org secret AZURE_SUBSCRIPTION_ID)
+        required: false
+      app-env:
+        description: Optional secret application settings in KEY=value lines; the deploy turns them into the Secret <service>-env
+        required: false
+    outputs:
+      image-digest:
+        description: Digest of the image pushed by this run (empty when nothing was pushed)
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Explicit bash also turns on pipefail, so a failing command on the left of a pipe fails the step.
+    shell: bash
+
+env:
+  SERVICE: ${{ inputs.service }}
+  IMAGE: docker.io/${{ inputs.dockerhub-username }}/${{ inputs.image-name || inputs.service }}
+  CHART: ${{ inputs.chart-path }}
+  VALUES_FILE: ${{ inputs.values-file }}
+  DEV_VALUES_FILE: ${{ inputs.dev-values-file }}
+  NAMESPACE: ${{ inputs.namespace }}
+  # Tool versions in one place (the same Helm and kubectl versions are used on our laptops).
+  # Dependabot does not see these lines: bump them by hand (monthly, and kubectl on a cluster
+  # upgrade; Helm stays 4.x, ADR-047). How to look up an image digest: README, "Tool versions".
+  HELM_VERSION: v4.3.1 # Helm 4 (ADR-047); setup-helm would silently fall back to Helm 3 on "latest"
+  KUBECTL_VERSION: v1.35.10 # same minor version as the cluster (1.35)
+  ACTIONLINT_IMAGE: docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
+
+jobs:
+  test:
+    # A manual run only redeploys an image that was already tested and built on main.
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check the inputs
+        # The image name is checked in build and deploy only: pull requests from Dependabot or
+        # forks must pass without organization settings.
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          name='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+          [[ "$SERVICE" =~ $name ]] || fail "service must be a lowercase name (letters, digits, dashes)"
+          [[ "$NAMESPACE" =~ $name ]] || fail "namespace is not a valid Kubernetes name"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Workflow lint (actionlint, includes shellcheck)
+        run: docker run --rm -v "$PWD":/repo -w /repo "$ACTIONLINT_IMAGE" -color
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm # needs a committed package-lock.json
+
+      - name: Install dependencies exactly as locked
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests with coverage
+        # The service's "test" script runs the test runner once (for example "vitest run")
+        # and writes coverage/ (and optionally reports/junit.xml).
+        run: npm test -- --coverage
+
+      - name: Keep the test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports
+          path: |
+            coverage/
+            reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Helm is version 4
+        run: |
+          helm version --short
+          [[ "$(helm version --short)" == v4.* ]] || { echo "::error::expected Helm 4 ($HELM_VERSION)"; exit 1; }
+
+      - name: Chart lint and schema check (dev and prod values)
+        run: |
+          image_args=(--set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA")
+          for values in "$DEV_VALUES_FILE" "$VALUES_FILE"; do
+            echo "::group::$values"
+            helm lint "$CHART" -f "$values" "${image_args[@]}"
+            helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$values" "${image_args[@]}" \
+              | docker run --rm -i "$KUBECONFORM_IMAGE" -strict -summary -ignore-missing-schemas -
+            echo "::endgroup::"
+          done
+
+      - name: Chart has a smoke test (helm test hook)
+        # Without a test hook "helm test" passes without testing anything after the deploy.
+        if: inputs.deploy
+        run: |
+          helm template "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$VALUES_FILE" \
+            --set-string "image.repository=$IMAGE" --set-string "image.tag=sha-$GITHUB_SHA" \
+            | grep -Eq 'helm\.sh/hook"?:[[:space:]]*"?test' \
+            || { echo "::error::the chart has no helm test hook (templates/tests/): the smoke test would check nothing"; exit 1; }
+
+      - name: Set up Docker Buildx
+        if: github.event_name == 'pull_request'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image builds (not pushed)
+        # Catches Dockerfile errors before the merge; pull requests never push images.
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+
+  build:
+    needs: test
+    # Only main publishes images: every image on Docker Hub passed the tests of its commit.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Docker Hub name and token are available
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub-token }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IMAGE" =~ ^docker\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+            || fail "invalid image name; is the organization variable DOCKERHUB_USERNAME visible to this repository?"
+          [[ -n "$DOCKERHUB_TOKEN" ]] || fail "no Docker Hub token: is the org secret DOCKERHUB_TOKEN visible to this repository?"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ inputs.dockerhub-username }}
+          password: ${{ secrets.dockerhub-token }}
+
+      - name: Image tag from the full commit SHA
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=sha,format=long
+
+      - name: Build and push the image (once; prod runs exactly this image)
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Image of $SERVICE"
+            echo ""
+            echo "- Tag: \`$IMAGE:sha-$GITHUB_SHA\`"
+            echo "- Digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    # Push to main: only after a successful build. Manual run on main: test and build are
+    # skipped on purpose, and !cancelled() lets this job run anyway.
+    if: >-
+      ${{ !cancelled() && inputs.deploy && github.ref == 'refs/heads/main'
+      && ((github.event_name == 'push' && needs.build.result == 'success')
+      || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    # Longer than the Helm timeouts below added up, so the job timeout never kills a running
+    # "helm upgrade". A cancel by hand still can; the stuck-release check below then names the fix.
+    timeout-minutes: 25
+    # Deployment branch rule "main" on this environment; its history lists every prod deploy.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # Azure login with OIDC: no stored cloud password
+    concurrency:
+      # One deploy at a time per repository and namespace; a newer run never cancels a running
+      # deploy. Only one deploy can wait: a newer one replaces it, so the newest commit wins.
+      group: deploy-${{ github.repository }}-${{ inputs.namespace }}
+      cancel-in-progress: false
+    env:
+      SHA: ${{ inputs.sha || github.sha }}
+      BUILT_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Check the inputs
+        # The Azure IDs are only tested here, never printed (tenant and subscription are secrets,
+        # so the log masks them anyway).
+        env:
+          AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+          AZURE_TENANT_ID: ${{ secrets.azure-tenant-id }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.azure-subscription-id }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          name='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "sha must be a full 40-character commit SHA"
+          [[ "$SERVICE" =~ $name ]] || fail "service must be a lowercase name (letters, digits, dashes)"
+          [[ "$NAMESPACE" =~ $name ]] || fail "namespace is not a valid Kubernetes name"
+          [[ "$IMAGE" =~ ^docker\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+            || fail "invalid image name; is the organization variable DOCKERHUB_USERNAME visible to this repository?"
+          guid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$AZURE_CLIENT_ID" =~ $guid ]] \
+            || fail "azure-client-id is empty or not an ID: set the organization variable AZURE_CLIENT_ID and pass it in"
+          [[ "$AZURE_TENANT_ID" =~ $guid ]] \
+            || fail "azure-tenant-id is empty or not an ID: set the organization secret AZURE_TENANT_ID and pass it in"
+          [[ "$AZURE_SUBSCRIPTION_ID" =~ $guid ]] \
+            || fail "azure-subscription-id is empty or not an ID: set the organization secret AZURE_SUBSCRIPTION_ID and pass it in"
+
+      - name: A manual run deploys only a commit of main
+        # The image check below proves only that an image exists; this proves that the chart and
+        # the image belong to a commit on main (no unmerged branch or fork commit).
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$GITHUB_SHA" --jq .status) \
+            || { echo "::error::commit $SHA was not found in $GITHUB_REPOSITORY (or the GitHub API failed, see above)"; exit 1; }
+          [[ "$status" == ahead || "$status" == identical ]] \
+            || { echo "::error::commit $SHA is not on main (compare status: $status)"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }} # the chart of the same commit as the image
+          persist-credentials: false
+
+      - name: Image digest (built by this run, or looked up for a manual run)
+        id: image
+        run: |
+          if [[ -n "$BUILT_DIGEST" ]]; then
+            digest="$BUILT_DIGEST"
+          else
+            digest=$(docker buildx imagetools inspect "$IMAGE:sha-$SHA" --format '{{.Manifest.Digest}}') \
+              || { echo "::error::$IMAGE:sha-$SHA is not on Docker Hub (was it built by a push to main?) or the repository is private"; exit 1; }
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected image digest '$digest'"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ secrets.azure-tenant-id }}
+          subscription-id: ${{ secrets.azure-subscription-id }}
+
+      - name: Kubernetes context of the AKS cluster
+        uses: azure/aks-set-context@883bdc8d8d1d0fd87e66cc4ba6f0b618f9eb5281 # v5.0.1
+        with:
+          resource-group: ${{ inputs.aks-resource-group }}
+          cluster-name: ${{ inputs.aks-cluster-name }}
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Helm is version 4
+        run: |
+          helm version --short
+          [[ "$(helm version --short)" == v4.* ]] || { echo "::error::expected Helm 4 ($HELM_VERSION)"; exit 1; }
+
+      - name: Namespace exists
+        run: |
+          kubectl get namespace "$NAMESPACE" > /dev/null \
+            || { echo "::error::namespace $NAMESPACE is missing (or the cluster is stopped); it is created once by hand"; exit 1; }
+
+      - name: Release is not stuck from an interrupted deploy
+        # A cancel by hand or a lost runner can kill Helm halfway: the release then stays in
+        # pending-* and every later upgrade fails with "another operation is in progress".
+        # Only detect it and name the fix (someone may be running Helm by hand right now).
+        # Runs before the Secret step, so a stuck release fails before any setting changes.
+        run: |
+          err_file="$RUNNER_TEMP/helm-history.err"
+          if ! history=$(helm history "$SERVICE" -n "$NAMESPACE" -o json 2> "$err_file"); then
+            if grep -q 'not found' "$err_file"; then
+              echo "First install of $SERVICE: nothing to check."
+              exit 0
+            fi
+            cat "$err_file" >&2
+            echo "::error::helm history failed (see above)"
+            exit 1
+          fi
+          status=$(jq -r 'max_by(.revision) | .status' <<< "$history")
+          [[ "$status" == pending-* ]] || exit 0
+          good=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")]
+            | max_by(.revision) | .revision // empty' <<< "$history")
+          if [[ -n "$good" ]]; then
+            fix="helm rollback $SERVICE $good -n $NAMESPACE --wait"
+            echo "::error::release $SERVICE is stuck in $status (an earlier deploy was interrupted): run '$fix', then deploy again"
+          else
+            fix="helm uninstall $SERVICE -n $NAMESPACE"
+            echo "::error::release $SERVICE is stuck in $status and was never deployed: run '$fix', then deploy again"
+          fi
+          exit 1
+
+      - name: Application Secret from the organization secret (idempotent)
+        id: app-env
+        # Never "helm --set" for secrets: Helm keeps the values in the release history.
+        # Server-side apply keeps no copy of the values in an annotation.
+        env:
+          APP_ENV: ${{ secrets.app-env }}
+        run: |
+          if [[ -z "$APP_ENV" ]]; then
+            echo "No app-env secret passed: the Secret $SERVICE-env stays as it is."
+            exit 0
+          fi
+          # GitHub masks the whole secret, not its single values; "helm test --logs" or an error
+          # message could print one, so every value is masked for the rest of this job.
+          while IFS= read -r line; do
+            [[ "$line" == *=* && "$line" != '#'* ]] || continue
+            value="${line#*=}"
+            if [[ -n "$value" ]]; then echo "::add-mask::$value"; fi
+          done <<< "$APP_ENV"
+          umask 077
+          env_file="$RUNNER_TEMP/$SERVICE.env"
+          trap 'rm -f "$env_file"' EXIT
+          printf '%s\n' "$APP_ENV" > "$env_file"
+          kubectl create secret generic "$SERVICE-env" -n "$NAMESPACE" --from-env-file="$env_file" \
+            --dry-run=client -o yaml \
+            | kubectl apply --server-side --field-manager=ci-cd --force-conflicts -f -
+          # Pods read the Secret only when they start. A hash of the whole file (never the values;
+          # masked in the log as well) becomes a Pod annotation in the next step, so the Pods
+          # restart exactly when the settings change.
+          checksum=$(sha256sum < "$env_file" | cut -d' ' -f1)
+          echo "::add-mask::$checksum"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy with Helm (a failed rollout rolls back by itself)
+        id: deploy
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          APP_ENV_CHECKSUM: ${{ steps.app-env.outputs.checksum }}
+        run: |
+          extra=()
+          if [[ -n "$APP_ENV_CHECKSUM" ]]; then
+            extra=(--set-string "podAnnotations.checksum/app-env=$APP_ENV_CHECKSUM")
+          fi
+          helm upgrade --install "$SERVICE" "$CHART" -n "$NAMESPACE" -f "$VALUES_FILE" \
+            --set-string "image.repository=$IMAGE" \
+            --set-string "image.tag=sha-$SHA" \
+            --set-string "image.digest=$DIGEST" \
+            "${extra[@]}" \
+            --rollback-on-failure --wait --timeout 5m --history-max 10
+
+      - name: Smoke test inside the cluster (helm test)
+        id: smoke
+        run: helm test "$SERVICE" -n "$NAMESPACE" --timeout 2m --logs
+
+      - name: Roll back when the smoke test failed
+        id: rollback
+        if: failure() && steps.smoke.outcome == 'failure'
+        # Restores the image and the chart only; the Secret <service>-env keeps its current settings.
+        run: |
+          revisions=$(helm history "$SERVICE" -n "$NAMESPACE" -o json | jq length)
+          if (( revisions < 2 )); then
+            echo "::error::smoke test failed on the first install: there is no earlier revision to roll back to, fix forward"
+            exit 1
+          fi
+          helm rollback "$SERVICE" -n "$NAMESPACE" --wait --timeout 5m
+          echo "::error::smoke test failed: $SERVICE was rolled back to the previous revision"
+
+      - name: Deploy summary
+        if: always()
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$ROLLBACK_OUTCOME" == "skipped" ]]; then ROLLBACK_OUTCOME="not needed"; fi
+          revision="unknown"
+          if [[ -n "$DEPLOY_OUTCOME" && "$DEPLOY_OUTCOME" != "skipped" ]] && command -v helm > /dev/null; then
+            revision=$(helm history "$SERVICE" -n "$NAMESPACE" --max 1 -o json 2> /dev/null \
+              | jq -r '.[0] | "\(.revision) (\(.status))"') || revision="unknown"
+          fi
+          {
+            echo "### Deploy of $SERVICE to $NAMESPACE ($EVENT)"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`$SHA\` |"
+            echo "| Image | \`$IMAGE@${DIGEST:-unknown}\` |"
+            echo "| Helm upgrade | ${DEPLOY_OUTCOME:-not run} |"
+            echo "| Smoke test | ${SMOKE_OUTCOME:-not run} |"
+            echo "| Rollback after a failed smoke test | ${ROLLBACK_OUTCOME:-not needed} |"
+            echo "| Helm revision now | $revision |"
+          } >> "$GITHUB_STEP_SUMMARY"

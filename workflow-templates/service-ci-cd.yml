@@ -1,0 +1,54 @@
+# CI/CD of a Chance service. The steps live in the organization's shared workflow
+# (RSO-ekipa10/.github, .github/workflows/service-ci-cd.yml); this file only says when it runs
+# and with which settings. Save it as .github/workflows/ci-cd.yml and keep the job id "pipeline":
+# the branch ruleset requires the check "pipeline / test".
+name: ci-cd
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Redeploy or roll back to the image of this full commit SHA from main (empty = newest commit)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Pull requests: a newer push cancels the older run. Main and manual runs from main share one
+  # group, and a newer run never cancels a running one (a killed "helm upgrade" leaves the
+  # release stuck). GitHub keeps only one waiting run per group, so a newer merge or manual run
+  # replaces the waiting one and the newest commit wins: a replaced merge is not built (it shows
+  # as cancelled; its changes ship with the newer commit), and a manual run with an empty sha
+  # works only once the newest commit of main has been built. A manual run from another branch
+  # gets its own group and deploys nothing (only main deploys).
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.ref != 'refs/heads/main') && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pipeline:
+    permissions:
+      contents: read
+      id-token: write # only the shared deploy job uses it (Azure login with OIDC)
+    # Pin to the commit SHA of the shared workflow's newest release tag, with the tag in a
+    # comment (gh api repos/RSO-ekipa10/.github/commits/<tag> --jq .sha):
+    #   uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@<40-character SHA> # <tag>
+    # Dependabot then keeps the pin current. Only until the first release tag exists: @main.
+    uses: RSO-ekipa10/.github/.github/workflows/service-ci-cd.yml@main
+    with:
+      service: ${{ github.event.repository.name }}
+      dockerhub-username: ${{ vars.DOCKERHUB_USERNAME }}
+      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      sha: ${{ inputs.sha }}
+    secrets:
+      # Named secrets only (no "inherit"): the shared workflow gets nothing else.
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+      azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }} # secrets, so the public logs mask them
+      azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # Rename SERVICE_ENV to <SERVICE>_ENV (for example MARKETS_ENV), or remove the line.
+      app-env: ${{ secrets.SERVICE_ENV }}

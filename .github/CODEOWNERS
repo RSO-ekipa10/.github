@@ -1,0 +1,3 @@
+# The shared pipeline deploys every service to prod: changes need a review by the other team member.
+/.github/ @radov02 @DominikkMaximus
+/workflow-templates/ @radov02 @DominikkMaximus
